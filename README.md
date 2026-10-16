@@ -10,7 +10,7 @@
 4. Нажмите **Deploy** и дождитесь завершения первого развёртывания.
 5. В проекте Vercel откройте **Settings → Environment Variables**.
 6. Создайте переменные окружения ниже, выбрав **Production** для каждой:
-   - **Key:** GEMINI_API_KEY — **Value:** ключ из Google AI Studio: https://aistudio.google.com/app/apikey
+   - **Key:** GROQ_API_KEY — **Value:** ключ из GROQ Console: (https://console.groq.com/keys)
    - **Key:** SERPER_API_KEY — **Value:** ключ из Serper: https://serper.dev
 7. После сохранения ключей откройте **Deployments** и выберите **Redeploy** для последнего Production-развёртывания. Дождитесь статуса **Ready**.
 8. В Vercel откройте **Settings → Domains**, скопируйте свой домен и добавьте в конец /api. Например: https://YOUR-PROJECT.vercel.app/api.
