@@ -1,17 +1,20 @@
 const DEFAULT_MODEL = "openai/gpt-oss-120b";
+const DEFAULT_FALLBACK_MODEL = "llama-3.3-70b-versatile";
 const MAX_HISTORY_MESSAGES = 8;
 const MAX_HISTORY_MESSAGE_CHARS = 1200;
 const MAX_ALICE_TEXT = 1024;
-const TOTAL_RESPONSE_BUDGET_MS = 3600;
-const SERPER_TIMEOUT_MS = 600;
-const GROQ_TIMEOUT_MS = 2500;
+const TOTAL_RESPONSE_BUDGET_MS = 2900;
+const SERPER_TIMEOUT_MS = 900;
+const GROQ_TIMEOUT_MS = 2200;
+const MIN_RETRY_MS = 700;
 
 const SYSTEM_PROMPT = [
   "Ты — полезный голосовой помощник в навыке Яндекс Алисы.",
   "Отвечай естественно, по-русски, кратко и так, чтобы ответ было удобно слушать.",
   "Обычно используй 1–3 коротких предложения. Не используй Markdown, таблицы, списки с символами или длинные вступления.",
   "Если вопрос требует актуальных данных и переданы результаты поиска, опирайся на них; не выдумывай отсутствующие факты.",
-  "Если не знаешь ответа, честно скажи об этом."
+  "Если не знаешь ответа, честно скажи об этом.",
+  "У тебя нет инструментов и функций: никогда не пытайся вызывать поиск, браузер или любые функции, отвечай только текстом."
 ].join(" ");
 
 function aliceResponse(text, endSession = false, history = []) {
@@ -108,9 +111,41 @@ async function searchWeb(query, timeoutMs) {
     if (answerBox) items.unshift(`Краткий ответ поисковика: ${String(answerBox).slice(0, 350)}`);
     return items.length ? items.join("\n") : "";
   } catch (error) {
-    console.warn("Serper request did not finish in time; continuing without search.");
+    console.warn("Serper request failed or timed out; continuing without search.", error?.name || "");
     return "";
   }
+}
+
+function isModelName(model) {
+  return /^[A-Za-z0-9._/-]+$/.test(model);
+}
+
+async function callGroq(model, messages, timeoutMs) {
+  const key = process.env.GROQ_API_KEY;
+  const isReasoning = model.startsWith("openai/gpt-oss");
+
+  const payload = {
+    model,
+    messages,
+    temperature: 0.5,
+    max_tokens: isReasoning ? 1200 : 300
+  };
+  // gpt-oss: рассуждения тратят лимит токенов, поэтому минимизируем их
+  if (isReasoning) payload.reasoning_effort = "low";
+
+  const { response, data } = await fetchJson(
+    "https://api.groq.com/openai/v1/chat/completions",
+    {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "Authorization": `Bearer ${key}`
+      },
+      body: JSON.stringify(payload)
+    },
+    timeoutMs
+  );
+  return { response, data };
 }
 
 async function askGroq(text, history, searchContext, timeoutMs) {
@@ -119,7 +154,8 @@ async function askGroq(text, history, searchContext, timeoutMs) {
   if (timeoutMs < 250) throw new Error("TIME_BUDGET_EXHAUSTED");
 
   const model = String(process.env.GROQ_MODEL || DEFAULT_MODEL).trim();
-  if (!/^[A-Za-z0-9._/-]+$/.test(model)) throw new Error("INVALID_MODEL_NAME");
+  const fallbackModel = String(process.env.GROQ_FALLBACK_MODEL || DEFAULT_FALLBACK_MODEL).trim();
+  if (!isModelName(model) || !isModelName(fallbackModel)) throw new Error("INVALID_MODEL_NAME");
 
   const messages = [
     { role: "system", content: SYSTEM_PROMPT },
@@ -134,35 +170,48 @@ async function askGroq(text, history, searchContext, timeoutMs) {
     : text;
   messages.push({ role: "user", content: prompt });
 
-  const { response, data } = await fetchJson(
-    "https://api.groq.com/openai/v1/chat/completions",
-    {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "Authorization": `Bearer ${key}`
-      },
-      body: JSON.stringify({
-        model,
-        messages,
-        temperature: 0.5,
-        max_tokens: 240
-      })
-    },
-    Math.min(GROQ_TIMEOUT_MS, timeoutMs)
-  );
+  const startedAt = Date.now();
+  const left = () => timeoutMs - (Date.now() - startedAt);
 
-  if (!response.ok) {
-    const status = Number(response.status);
-    console.error("Groq request failed with HTTP", status, data);
-    if (status === 401 || status === 403) throw new Error("GROQ_KEY_REJECTED");
-    if (status === 429) throw new Error("GROQ_QUOTA");
-    throw new Error("GROQ_REQUEST_FAILED");
+  const attempts = [model];
+  if (fallbackModel && fallbackModel !== model) attempts.push(fallbackModel);
+
+  let lastError = new Error("GROQ_REQUEST_FAILED");
+
+  for (let i = 0; i < attempts.length; i++) {
+    const current = attempts[i];
+    const budget = Math.min(GROQ_TIMEOUT_MS, left());
+    if (i > 0 && budget < MIN_RETRY_MS) break;
+
+    try {
+      const { response, data } = await callGroq(current, messages, budget);
+
+      if (!response.ok) {
+        const status = Number(response.status);
+        const code = data?.error?.code;
+        console.error("Groq request failed", { model: current, status, code, message: data?.error?.message });
+        if (status === 401 || status === 403) throw new Error("GROQ_KEY_REJECTED");
+        if (status === 429) throw new Error("GROQ_QUOTA");
+        // tool_use_failed: модель попыталась вызвать несуществующий инструмент -> пробуем запасную модель
+        lastError = new Error(code === "tool_use_failed" ? "GROQ_TOOL_CALL" : "GROQ_REQUEST_FAILED");
+        continue;
+      }
+
+      const choice = data?.choices?.[0];
+      const answer = choice?.message?.content?.trim() || "";
+      if (!answer) {
+        console.error("Groq empty content", { model: current, finish_reason: choice?.finish_reason });
+        lastError = new Error("GROQ_EMPTY_RESPONSE");
+        continue;
+      }
+      return answer;
+    } catch (error) {
+      if (["GROQ_KEY_REJECTED", "GROQ_QUOTA"].includes(error?.message)) throw error;
+      lastError = error?.name === "AbortError" ? new Error("TIME_BUDGET_EXHAUSTED") : error;
+    }
   }
 
-  const answer = data?.choices?.[0]?.message?.content?.trim() || "";
-  if (!answer) throw new Error("GROQ_EMPTY_RESPONSE");
-  return answer;
+  throw lastError;
 }
 
 function errorForUser(error) {
@@ -174,7 +223,6 @@ function errorForUser(error) {
     case "GROQ_QUOTA":
       return "Сейчас превышен лимит запросов к Groq. Попробуйте немного позже.";
     case "TIME_BUDGET_EXHAUSTED":
-    case "AbortError":
       return "Не успела подготовить ответ. Попробуйте задать вопрос ещё раз, чуть короче.";
     default:
       return "Не получилось получить ответ от нейросети. Попробуйте ещё раз чуть позже.";
@@ -212,14 +260,14 @@ export default async function handler(req, res) {
   try {
     let searchContext = "";
     if (isSearchIntent(text) && process.env.SERPER_API_KEY) {
-      searchContext = await searchWeb(text, Math.min(SERPER_TIMEOUT_MS, Math.max(0, remainingMs() - 2600)));
+      searchContext = await searchWeb(text, Math.min(SERPER_TIMEOUT_MS, Math.max(0, remainingMs() - 1500)));
     }
 
     const answer = await askGroq(
       text,
       oldHistory,
       searchContext,
-      Math.max(0, Math.min(GROQ_TIMEOUT_MS, remainingMs() - 600))
+      Math.max(0, Math.min(GROQ_TIMEOUT_MS, remainingMs() - 150))
     );
 
     const history = [
@@ -230,7 +278,7 @@ export default async function handler(req, res) {
 
     return res.status(200).json(aliceResponse(answer, false, history));
   } catch (error) {
-    const safeError = error?.message === "AbortError" ? "TIME_BUDGET_EXHAUSTED" : error;
+    const safeError = error?.name === "AbortError" ? new Error("TIME_BUDGET_EXHAUSTED") : error;
     console.warn("Alice webhook returned a fallback response:", safeError?.message || "unknown error");
     return res.status(200).json(aliceResponse(errorForUser(safeError), false, oldHistory));
   }
